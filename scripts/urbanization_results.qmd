@@ -1,0 +1,362 @@
+---
+title: "Urbanization Analysis"
+author: "Isaac Rosenthal"
+format: 
+  html:
+     toc: true
+     embed-resources: true
+editor: visual
+---
+
+# Overview
+
+Below are my models and associated visualizations. The data used, `kelp_data`, is structured as follows:
+
+```{r message = FALSE, warning=FALSE}
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(glmmTMB)
+library(visreg)
+kelp_data <- readRDS("../data/kelp_data/no_hyper/kelp_cover_temp_data_test.rds") |> 
+  #drop BIG_SUR site - this was an old and bad bounding box. BIG_SUR_2 is our new best friend.
+  filter(site != "BIG_SUR")
+str(kelp_data)
+```
+
+-   `Year` and `site` should be self explanatory.
+
+-   `summer_mean_biomass_per_station` and `spring_mean_biomass_per_station` are the average kelp biomass per station (aka 30 meter landsat pixel). This was calculated at a site level: I grouped all stations by site, year, and quarter and summarized the mean biomass. This is to account for nonstandard site areas, as we could not simply use the sum total biomass for a comparison.
+
+    -   `summer_mean_biomass_per_station` is the response variable in our models.
+
+    -   `spring_mean_biomass_per_station` is included as a fixed effect as a control measure. We expect this to be tightly correlated to summer mean biomass, and if it is not, there is likely an issue with the reliability of our data/methods. Individual sites/years may become decoupled between spring and summer if there is a major disturbance event, but overall these should be significantly related with spring biomass directly driving summer biomass.
+
+-   `summer_mean_temp` and `spring_mean_temp` are derived from the quarter degree OISST dataset. I grouped the OISST data for each site's bounding box by year and quarter, and summarized the mean temperature.
+
+-   `urban_pixel_fraction` is the proportion of pixels within each site's bounding box classified as "Developed".
+
+-   `site_mean_summer_temp` and `site_mean_spring_temp` are the mean temperatures at each site, across all years. These are to account for unobserved variables that are associated with temperature that we did not directly include/measure. For example, strong upwelling could be flood a site with cool water that is also nutrient rich. While this *could* be left for the random effect to handle, because it is correlated to our yearly temperature predictors (independent variables), it is more appropriate to handle it this way.
+
+-   `site_mean_spring_biomass` is the average biomass per station at each site, across all years. I grouped all stations by site and quarter and summarized the mean biomass. This is to account for unobserved variables that are associated with spring biomass that we did not include directly. For example, strong grazer presence at one sight could be depressing kelp biomass relative to other sites.
+
+-   `site_mean_urban` is the average fraction of pixels within each site's bounding box classified as "Developed" across all years. This is to account for unobserved variables that are associated with urbanization that we did not measure. For example, population density or coastal road use intensity: you would expect these to be correlated with amount of developed land, but they are not correlated 1:1 with measurements of impervious surface.
+
+# Mundlak Model with fixed effect of year ("One-way" Mundlak)
+
+This is a model with all interactions and a fixed effect of year. All parameters described above are included, as well as the following:
+
+-   `spring_mean_temp*urban_pixel_fraction`: This is the bread and butter of this model. We are testing for an interaction between growth season temperatures and urbanization, with the hypothesis being that while kelps are vulnerable to both individually, they may respond unpredictably when both are present. For example, healthy kelp recruits may be able to outpace sedimentation via rapid growth, but if the water is too warm they may be unable to keep up and become smothered in high sedimentation regimes.
+
+-   `site_mean_spring_temp*site_mean_urban` : This is to account for potential interacting confounders. These parameters are "catch-alls" in that they are capturing influence from a variety of unobserved variables, and it's possible that some of them are interacting with each other. For example, if warmer sites are characterized by more preciptiation, and high levels of urbanization are associated with more CSOs, there may be nonlinear interactions between these two parameters that we must account for (honestly, it would have been interesting if this was significant!!)
+
+-   `year`: This to account for variability between years that isn't otherwise captured by our temporal confounder terms.
+
+-   Random effect of `site`, to account for variability between sites that isn't otherwise captured by our site mean temperature, spring biomass, and urbanization parameters. This could include things like shipping activity to more stringent local fishing regulations.
+
+```{r}
+options(width = 120)
+mundlak_mod_site_year <- lmer(summer_mean_biomass_per_station ~
+                               urban_pixel_fraction + site_mean_urban + 
+                               summer_mean_temp + site_mean_summer_temp + 
+                               spring_mean_temp + site_mean_spring_temp + 
+                               spring_mean_biomass_per_station + site_mean_spring_biomass + 
+                               spring_mean_temp*urban_pixel_fraction +
+                               site_mean_spring_temp*site_mean_urban + 
+                               year +
+                               (1|site),
+                             data = kelp_data,
+                             REML = T)
+```
+
+### Model Results and Interpretation
+
+```{r}
+summary(mundlak_mod_site_year)
+```
+
+-   `urban_pixel_fraction`: not significant, not a problem because the interaction is signficant. This just means that it's more complicated than strictly urbanization -\> biomass
+
+-   `summer_mean_temp`: makes sense as these summer maxima are a growth limiter (or in the case of a climactic event such as el nino, can begin the yearly attrition)
+
+-   `site_mean_summer_temp`: similar reasoning: sites that tend to be warmer in the summer tend to have less kelp in the summer.
+
+-   `spring_mean_temp`: again, similar reasoning as above. warmer springs -\> less kelp growth
+
+-   `site_mean_spring_temp`: significant but interestingly, a positive coefficient. Something that is confounded with spring temperatures appears to have a positive outcome on kelp when looked at across all years (aka a spatial confounder)
+
+-   `spring_mean_biomass_per_station`: very significant, which makes sense. if this wasn't, we would have issues.
+
+-   `year`: not significant, implying there aren't any temporal confounders. if this was significant, it would mean that there was something happening at an annual scale that isn't associated with temperature or urbanization, but that was affecting kelp.
+
+-   `urban_pixel_fraction:spring_mean_temp`: significant! This means that both temperature and urbanization affect kelp, and the impact of one is determined by the other. Keep reading for a visualization.
+
+-   `site_mean_urban:site_mean_spring_temp`: not significant. good, this means there are no interactions between unobserved variables associated with site (aka spatial confounders)
+
+```{r}
+performance::r2(mundlak_mod_site_year)
+
+```
+
+Solid R2.
+
+### Model visualization
+
+This is rough, but interaction effects are hard and I don't want to spend too much time coding a plot before we have locked in what it should say. I actually like the default cut that visreg does here (10th, 50th, and 90th quantiles) as if I mess around with it too much I am really just looking at the top and bottom sites (in terms of observation) as the high and low.
+
+```{r}
+visreg(mundlak_mod_site_year, "spring_mean_temp", 
+       by ="urban_pixel_fraction", 
+       overlay = T, 
+       breaks = 3, 
+       gg = TRUE) +
+  theme_bw() +
+  labs(title="Interaction effect between Urbanization and \n Spring Temperatures on Summer Kelp Biomass", subtitle = "Conditional on Summer SST, year, and Spring Kelp Biomass",
+       x ="Temperature (C)'", y = "Summer Kelp Canopy Biomass \n (Wet Kg/pixel)") +
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 13),
+        axis.text.y = element_text(size = 13),
+        title = element_text(size = 15)) 
+```
+
+I think this makes it the most clear, out of all the ways to orient the parameters. The reciprocal effect can also be seen (especially if you add more temperature breaks), but because the story here is more focused on how urbanization interacts with climate change (and not the other way around, despite how similar they sound), I think having the plot show how the temp X biomass relationship changes based on urbanization best reflects that.
+
+For completeness, here's the plot but switched around. I added a few more lines, just to see what the hotter temps looked like and it definitely tells the same story -- when it's hot, there's a much weaker relationship between urbanization and biomass.
+
+One thing I am wondering about is that it looks like these are converging. What is the signfificance of the less developed areas
+
+```{r}
+options(width = 120)
+
+visreg(mundlak_mod_site_year, "urban_pixel_fraction", 
+       by ="spring_mean_temp", 
+       overlay = T, 
+       breaks = 5, 
+       gg = TRUE) +
+  theme_bw() +
+  labs(title="Interaction effect between Urbanization and \n Spring Temperatures on Summer Kelp Biomass", subtitle = "Conditional on Summer SST, year, and Spring Kelp Biomass",
+       x ="Fraction of Pixels Classified as 'Developed'", y = "Summer Kelp Canopy Biomass \n (Wet Kg/pixel)") +
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 13),
+        axis.text.y = element_text(size = 13),
+        title = element_text(size = 15)) 
+```
+
+# Mundlak Model with annual means for temp and urbanization ("two-way" Mundlak)
+
+This is a model with all interactions, but instead of treating year as a fixed effect, we added in annual means for our predictors. This "two-way" Mundlak approach accounts for both spatial confounders (i.e., unobserved variables associated with our sites) and temporal confouders (i.e., unobserved variables associated with each year). It includes all of the paremeters described above, except that instead of a fixed effect of `year`, we include 3 more mean predictors and a random effect of `year`.
+
+-   `annual_mean_summer_temp`: This is to account for potential temporal confounders associated with summer temperatures. For example, there could be a region-wide phenomenon in which hotter years had more intense wave energy or precipitation.
+
+-   `annual_mean_spring_temp` : Same reasoning as above, but for spring temps.
+
+-   `annual_mean_urban` : Same reasoning as above, but for urbanization. This is likely meaningless as urbanization doesn't really have anything to do with a specific year, although there could be scenarios in which some state-wide regulation change leads to systemic changes in urbanization and its impacts.
+
+-   `year` is now a random effect to account for temporal variability that is not already accounted for by the new temporal confounder terms.
+
+First, some wrangling
+
+```{r}
+#add annual means
+kelp_data <- kelp_data |>
+  group_by(year) |>
+  mutate(annual_mean_summer_temp = mean(summer_mean_temp),
+         annual_mean_spring_temp = mean(spring_mean_temp),
+         annual_mean_urban = mean(urban_pixel_fraction))
+```
+
+Now the model
+
+```{r}
+options(width = 120)
+two_way_mundlak_mod_site_year <- lmer(summer_mean_biomass_per_station ~ 
+                                urban_pixel_fraction + site_mean_urban + annual_mean_urban +
+                                summer_mean_temp + site_mean_summer_temp + annual_mean_summer_temp +
+                                spring_mean_temp + site_mean_spring_temp + annual_mean_spring_temp +
+                                spring_mean_biomass_per_station + site_mean_spring_biomass + 
+                                spring_mean_temp*urban_pixel_fraction +
+                                site_mean_spring_temp*site_mean_urban + 
+                                (1|site) + (1|year),
+                              data = kelp_data,
+                              REML = T)
+```
+
+### Model Results and Interpretation
+
+```{r}
+summary(two_way_mundlak_mod_site_year)
+```
+
+-   `summer_mean_temp`: makes sense for the same reasoning as above: hot summer water can limit growth
+
+-   `site_mean_summer_temp`: again, similar reasoning: sites that tend to be warmer in the summer tend to have less kelp in the summer.
+
+-   `spring_mean_temp`: again, similar reasoning as above. warmer springs -\> less kelp growth
+
+-   `site_mean_spring_temp`: significant but interestingly, a positive coefficient. Something that is confounded with spring temperatures appears to have a positive outcome on kelp when looked at across all years (aka a spatial confounder)
+
+-   `annual_mean_spring_temp`: in addition to a spatial confounder, there is something confounded with spring temps that is influencing kelp biomass opposite of the effect of actual temperature as it is a positive coef rather than negative (as seen with `spring_mean_temp`).
+
+-   `spring_mean_biomass_per_station`: very significant, which makes sense. if this wasn't, we would have issues.
+
+-   `urban_pixel_fraction:spring_mean_temp`: significant! This means that both temperature and urbanization affect kelp, and the impact of one is determined by the other. Keep reading for a visualization.
+
+-   `site_mean_urban:site_mean_spring_temp`: not significant. good, this means there are no interactions between unobserved variables associated with site (aka spatial confounders)
+
+```{r}
+performance::r2(two_way_mundlak_mod_site_year)
+
+```
+
+This one fits a bit better than having a fixed effect of year.
+
+### Model visualization
+
+```{r}
+visreg(two_way_mundlak_mod_site_year, "spring_mean_temp", 
+       by ="urban_pixel_fraction", 
+       overlay = T, 
+       breaks = 4, 
+       gg = TRUE) +
+  theme_bw() +
+  labs(title="Interaction effect between Urbanization and \n Spring Temperatures on Summer Kelp Biomass", subtitle = "Conditional on Summer SST, year, and Spring Kelp Biomass",
+       x ="Temperature (C)'", y = "Summer Kelp Canopy Biomass \n (Wet Kg/pixel)") +
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 13),
+        axis.text.y = element_text(size = 13),
+        title = element_text(size = 15)) 
+```
+
+With a 2-way mundlak, we don't see the flattening of the line unless we adjust the cutoffs to include the very top and bottom tails of the data, but the pattern holds if we do.
+
+# Beta regression on percent cover (Beta Mundlak)
+
+Data wrangling is not in this report (I can send that over if wanted, but most of it is just renaming columns after making long data wide). To calculate percent cover I first found the number of pixels in each site that EVER contain kelp (aka `site_pixel_count`), across all years. I then find the number of pixels that ever contain kelp within each year/quarter at each site (`quarterly_pixel_count`). Quarterly percent cover was calculated as `kelp_quarterly_percent_cover = quarterly_pixel_count/site_pixel_count`
+
+```{r}
+#load up kelp cover data (wrangled in percent_cover.R)
+kelp_cover_data <- readRDS("../data/kelp_data/no_hyper/kelp_cover_full.rds") |>
+  select(-quarter)
+```
+
+This is essentially the same model as before, except as we are dealing with percent cover data we are using a beta regression. This is far more appropriate than a normal error distribution + transformation, as the beta distribution is naturally bounded by 0 and 1.
+
+```{r}
+cover_mod_site_int <- glmmTMB(summer_kelp_percent_cover ~ urban_pixel_fraction + site_mean_urban + 
+                   summer_mean_temp + site_mean_summer_temp + 
+                   spring_mean_temp + site_mean_spring_temp + 
+                   spring_kelp_percent_cover + site_mean_spring_kelp_percent_cover + 
+                   spring_mean_temp*urban_pixel_fraction +
+                   site_mean_spring_temp*site_mean_urban +
+                   year +
+                   (1|site),
+                 data = kelp_cover_data,
+                 REML = T,
+                 family = beta_family(link = "logit"))
+```
+
+### Model Results and Interpretation
+
+```{r}
+summary(cover_mod_site_int)
+```
+
+This is harder to interpret to me. It seems like we have significant effects from most of our temperature parameters (but not growth season temps), as well as interacting spatial confounders. I'm not actually surprised that these data are messy though - I think the detection is pretty sensitive, therefore we are losing a lot of signal in comparison to using the biomass data.
+
+# Change analysis
+
+What if we look at annual kelp/temp/urbanization change, rather than the actual values? First we must calculate these lagged values
+
+```{r}
+kelp_data_lags <- kelp_data |>
+  group_by(site) |>
+  mutate(delta_summer_mean_biomass_per_station = summer_mean_biomass_per_station -lag(summer_mean_biomass_per_station),
+         delta_spring_mean_biomass_per_station = spring_mean_biomass_per_station -lag(spring_mean_biomass_per_station)) |>
+  filter(!is.na(delta_summer_mean_biomass_per_station)) |>
+  mutate(delta_summer_mean_temp = (summer_mean_temp - lag(summer_mean_temp)),
+         delta_spring_mean_temp = (spring_mean_temp - lag(spring_mean_temp)),
+         delta_urban_pixel_fraction = (urban_pixel_fraction - lag(urban_pixel_fraction)))|>
+  filter(!is.na(delta_summer_mean_temp)) |>
+  mutate(delta_site_mean_spring_biomass = mean(delta_spring_mean_biomass_per_station),
+         delta_site_mean_summer_temp = mean(delta_summer_mean_temp),
+         delta_site_mean_spring_temp = mean(delta_spring_mean_temp),
+         delta_site_mean_urban_pixel_fraction = mean(delta_urban_pixel_fraction)) |>
+  ungroup() 
+```
+
+The model is essentially the same as our initial two way mundlak model, but using our parameter deltas rather than their raw values.
+
+```{r}
+mundlak_mod_change <- lmer(delta_summer_mean_biomass_per_station ~                                              delta_urban_pixel_fraction + delta_site_mean_urban_pixel_fraction + 
+                             delta_summer_mean_temp + delta_site_mean_summer_temp + 
+                             delta_spring_mean_temp + delta_site_mean_spring_temp + 
+                             delta_spring_mean_biomass_per_station +  
+                             delta_site_mean_spring_biomass + 
+                             delta_spring_mean_temp*delta_urban_pixel_fraction +
+                             delta_site_mean_spring_temp*delta_site_mean_urban_pixel_fraction + 
+                             year +
+                             (1|site),
+                    data = kelp_data_lags,
+                    REML = T)
+
+```
+
+### Model Results and Interpretation
+
+```{r}
+summary(mundlak_mod_change)
+
+```
+
+Again, not much interesting here. I think it is likely because year to year urbanization deltas are extremely low.
+
+# Change \~ percent cover analysis
+
+We also talked about a lm where we look for impacts of change on percent cover, rather than on biomass. Why is this an lm and not a beta regression?
+
+```{r}
+
+#calculate lagged percent cover
+kelp_cover_data_lags <- kelp_cover_data |>
+  group_by(site) |>
+  mutate(delta_summer_kelp_percent_cover = summer_kelp_percent_cover -lag(summer_kelp_percent_cover)) |>
+  mutate(delta_spring_kelp_percent_cover = spring_kelp_percent_cover -lag(spring_kelp_percent_cover)) |>
+  filter(!is.na(delta_summer_kelp_percent_cover)) |>
+  mutate(delta_site_mean_spring_kelp_percent_cover = mean(delta_spring_kelp_percent_cover)) |>
+  ungroup() 
+
+
+#join on to the rest of the lagged data
+
+kelp_data_complete <- kelp_cover_data_lags |>
+  left_join(kelp_data_lags) |>
+  filter(!is.na(annual_mean_summer_temp)) 
+
+kelp_data_complete$site_code <- as.numeric(as.factor(kelp_data_complete$site))                                     
+```
+
+```{r}
+delta_lm <- lmer(delta_summer_kelp_percent_cover ~ delta_urban_pixel_fraction + delta_site_mean_urban_pixel_fraction + 
+                             delta_summer_mean_temp + delta_site_mean_summer_temp + 
+                             delta_spring_mean_temp + delta_site_mean_spring_temp + 
+                             delta_spring_kelp_percent_cover +  
+                             delta_site_mean_spring_kelp_percent_cover + 
+                             delta_spring_mean_temp*delta_urban_pixel_fraction +
+                             delta_site_mean_spring_temp*delta_site_mean_urban_pixel_fraction + 
+                             year +
+                             (1|site),
+                    data = kelp_data_complete, REML = TRUE)
+```
+
+### Model Results and Interpretation
+
+```{r}
+summary(delta_lm)
+```
+
+There is nothing significant here, as far as I can tell.
